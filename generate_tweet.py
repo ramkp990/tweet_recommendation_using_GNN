@@ -1,3 +1,4 @@
+'''
 import csv
 import random
 
@@ -640,3 +641,61 @@ with open("tweets.csv", "w", newline="", encoding="utf-8") as f:
         writer.writerow([tweet])
 
 print(f"Saved {len(tweets)} tweets to tweets.csv")
+
+'''
+
+def convert_tweets_file(input_file, output_file):
+    # Define category names (you can modify these as needed)
+    categories = [
+        "politics_prompts",
+        "sports",
+        "cryptocurrency",
+        "technology",
+        "entertainment",
+        "health",
+        "business",
+        "travel",
+        "food"
+    ]
+    
+    with open(input_file, 'r', encoding='utf-8') as infile:
+        lines = infile.readlines()
+    
+    with open(output_file, 'w', encoding='utf-8') as outfile:
+        # Process each line (each topic)
+        for i, line in enumerate(lines):
+            if i >= len(categories):
+                # If there are more lines than categories, use generic names
+                category_name = f"topic_{i+1}"
+            else:
+                category_name = categories[i]
+            
+            # Split the line by semicolons and clean up tweets
+            tweets = [tweet.strip() for tweet in line.strip().split(';') if tweet.strip()]
+            
+            # Write the category assignment
+            outfile.write(f"{category_name} = [\n")
+            
+            # Write each tweet as a quoted string
+            for j, tweet in enumerate(tweets):
+                # Check if it's the last tweet in the list
+                if j == len(tweets) - 1:
+                    outfile.write(f'    "{tweet}"\n')
+                else:
+                    outfile.write(f'    "{tweet}",\n')
+            
+            # Close the list
+            if i == len(lines) - 1:
+                outfile.write("]\n")
+            else:
+                outfile.write("],\n\n")
+
+def main():
+    input_filename = "tweets_new.txt"  # Change this to your input file name
+    output_filename = "formatted_tweets.txt"  # Change this to your desired output file name
+    
+    convert_tweets_file(input_filename, output_filename)
+    print(f"Conversion complete! Output saved to {output_filename}")
+
+if __name__ == "__main__":
+    main()

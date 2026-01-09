@@ -6,8 +6,8 @@ from torch_geometric.nn import HeteroConv, SAGEConv  # SAGEConv works well for h
 # ----------------------------
 # Load and prepare data (your code)
 # ----------------------------
-data = torch.load("higgs_processed.pt")
-data = torch.load("higgs_processed.pt", weights_only=False)
+data = torch.load("synthetic_processed_with_semantics.pt")
+data = torch.load("synthetic_processed_with_semantics.pt", weights_only=False)
 activity_sub = data['activity_sub']
 
 # DIAGNOSTIC: What are the actual post_id values?
@@ -24,9 +24,25 @@ print("Are post_id values in post_to_idx keys?",
 user_to_idx = data['user_to_idx']
 post_to_idx = data['post_to_idx']
 x = data['x']
+
+
+
+num_users = len(user_to_idx)
+post_features = x[num_users:]  # [P, 387]
+
+# Boost semantic part (dims 3-386)
+semantic_boost = 2.0
+post_features[:, 3:] *= semantic_boost
+
+# Rebuild x
+x = torch.cat([x[:num_users], post_features], dim=0)
+
+
+
 edge_index_social = data['edge_index_social']
 activity_sub = data['activity_sub']
 
+#activity_sorted = activity_sub
 activity_sorted = activity_sub.sort_values("timestamp").reset_index(drop=True)
 #activity_sorted["post_id"] = activity_sorted.index
 
@@ -183,6 +199,44 @@ class SimpleRGCN(torch.nn.Module):
         
         return x_dict
 
+class WeightedRGCN(torch.nn.Module):
+    def __init__(self, hidden_dim=64):
+        super().__init__()
+        # For updating USERS
+        self.user_from_social = SAGEConv((-1, -1), hidden_dim)   # user ← user (social)
+        self.user_from_posts = SAGEConv((-1, -1), hidden_dim)    # user ← post (rev_engages)
+        
+        # For updating POSTS (optional; you can even skip this!)
+        self.post_from_users = SAGEConv((-1, -1), hidden_dim)    # post ← user (engages)
+        
+        # Weights: direct engagement > social influence
+        self.w_direct = torch.nn.Parameter(torch.tensor(1.0))
+        self.w_social = torch.nn.Parameter(torch.tensor(0.3))
+
+    def forward(self, x_dict, edge_index_dict):
+        user_x, post_x = x_dict['user'], x_dict['post']
+        
+        # Update USERS
+        msg_social = self.user_from_social(
+            (user_x, user_x),
+            edge_index_dict[('user', 'social', 'user')]
+        )
+        msg_direct = self.user_from_posts(
+            (post_x, user_x),
+            edge_index_dict[('post', 'rev_engages', 'user')]  # ← you have this!
+        )
+        user_out = F.relu(self.w_social * msg_social + self.w_direct * msg_direct)
+        
+        # Update POSTS (optional)
+        msg_engage = self.post_from_users(
+            (user_x, post_x),
+            edge_index_dict[('user', 'engages', 'post')]  # ← you have this!
+        )
+        post_out = F.relu(msg_engage)
+        
+        return {'user': user_out, 'post': post_out}
+    
+
 
 import torch
 import torch.nn.functional as F
@@ -194,7 +248,7 @@ import random
 # Training Setup
 # ----------------------------
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = SimpleRGCN(hidden_dim=64).to(device)
+model = WeightedRGCN(hidden_dim=64).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 criterion = torch.nn.BCEWithLogitsLoss()
 
@@ -362,3 +416,45 @@ torch.save({
     'user_to_idx': user_to_idx,
     'num_users': num_users,
 }, "higgs_embeddings_trained.pt")
+
+# === MANUAL INSPECTION: Print top recommendations for test users ===
+print("\n🔍 SAMPLE RECOMMENDATIONS (Top 3 per user):")
+test_users_sample = list(set(test_edges_device[0].cpu().numpy()))[:5]  # First 5 test users
+
+# Load tweet texts for lookup
+activity_sub = data['activity_sub']  # from your loaded .pt file
+tweet_lookup = {}
+for _, row in activity_sub.iterrows():
+    global_post_id = post_to_idx[row["post_id"]]  # local → global
+    tweet_lookup[global_post_id] = row["tweet"]
+
+for user_global in test_users_sample:
+    user_local = user_global  # users are 0-indexed globally
+    true_posts_global = test_edges_device[1][test_edges_device[0] == user_global].cpu().numpy()
+    
+    # Get candidate posts (all test-period posts)
+    candidate_posts_global = set(test_edges_device[1].cpu().numpy())
+    candidate_posts_local = [int(gid - num_users) for gid in candidate_posts_global]
+    candidate_posts_global = list(candidate_posts_global)
+    
+    # Score all candidates
+    scores = torch.mm(
+        user_emb[user_local].unsqueeze(0),
+        post_emb[torch.tensor(candidate_posts_local, device=device)].T
+    ).squeeze(0)
+    
+    # Get top-3
+    topk_idx = torch.topk(scores, min(3, len(scores)))[1]
+    top_posts_local = [candidate_posts_local[i] for i in topk_idx]
+    top_posts_global = [pid + num_users for pid in top_posts_local]
+    
+    print(f"\nUser {user_global}:")
+    print("  ✅ True future engagements:")
+    for p in true_posts_global:
+        tweet = tweet_lookup.get(p, "[MISSING]")
+        print(f"    - {tweet[:60]}...")
+    
+    print("  🎯 Top recommendations:")
+    for p in top_posts_global:
+        tweet = tweet_lookup.get(p, "[MISSING]")
+        print(f"    - {tweet[:60]}...")
