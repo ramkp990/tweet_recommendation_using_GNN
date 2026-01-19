@@ -237,6 +237,37 @@ class WeightedRGCN(torch.nn.Module):
         
         return {'user': user_out, 'post': post_out}
     
+class WeightedRGCNFixed(torch.nn.Module):
+    def __init__(self, hidden_dim=64):
+        super().__init__()
+        self.user_from_social = SAGEConv((-1, -1), hidden_dim)
+        self.user_from_posts = SAGEConv((-1, -1), hidden_dim)
+        self.post_from_users = SAGEConv((-1, -1), hidden_dim)
+        
+        # FIXED weights (not Parameters)
+        self.w_direct = 1.0
+        self.w_social = 0.3
+
+    def forward(self, x_dict, edge_index_dict):
+        user_x, post_x = x_dict['user'], x_dict['post']
+        
+        msg_social = self.user_from_social(
+            (user_x, user_x),
+            edge_index_dict[('user', 'social', 'user')]
+        )
+        msg_direct = self.user_from_posts(
+            (post_x, user_x),
+            edge_index_dict[('post', 'rev_engages', 'user')]
+        )
+        user_out = F.relu(self.w_social * msg_social + self.w_direct * msg_direct)
+        
+        msg_engage = self.post_from_users(
+            (user_x, post_x),
+            edge_index_dict[('user', 'engages', 'post')]
+        )
+        post_out = F.relu(msg_engage)
+        
+        return {'user': user_out, 'post': post_out}
 
 
 import torch
@@ -249,7 +280,7 @@ import random
 # Training Setup
 # ----------------------------
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = WeightedRGCN(hidden_dim=64).to(device)
+model = WeightedRGCNFixed(hidden_dim=64).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 criterion = torch.nn.BCEWithLogitsLoss()
 

@@ -79,15 +79,19 @@ torch.save({
     'num_posts': P,
 }, "higgs_processed.pt")
 '''
+
+
+
 import pandas as pd
 import numpy as np
 import torch
 from sentence_transformers import SentenceTransformer
+import json
 
 # ----------------------------
 # 1. Load synthetic activity data (must include 'tweet' column)
 # ----------------------------
-activity = pd.read_csv("synthetic_higgs_activity_new.csv")
+activity = pd.read_csv("synthetic_higgs_full_all_users.csv")
 required_cols = ["engager", "target_user", "timestamp", "interaction", "tweet"]
 activity = activity[required_cols].copy()
 
@@ -97,7 +101,7 @@ activity = activity[required_cols].copy()
 social = pd.read_csv("higgs_social_network.edgelist", sep=" ", header=None, names=["follower", "followee"])
 
 # ----------------------------
-# 3. Subset to top 5K users
+# 3. Subset to top 5K users (for training feasibility)
 # ----------------------------
 user_counts = pd.concat([activity["engager"], activity["target_user"]]).value_counts()
 top_users = user_counts.head(5000).index
@@ -108,13 +112,36 @@ activity_sub = activity[
 ].copy().head(10000).reset_index(drop=True)
 activity_sub["post_id"] = activity_sub.index
 
+# ----------------------------
+# 4. Load user_to_topic mapping (from clustering on FULL graph)
+# ----------------------------
+with open("user_to_topic_full.json", "r") as f:
+    user_to_topic_full = json.load(f)
+# Convert keys to int
+user_to_topic_full = {int(k): int(v) for k, v in user_to_topic_full.items()}
+
+# ----------------------------
+# 5. Filter SOCIAL EDGES to be within-topic (using full mapping)
+# ----------------------------
 social_sub = social[
     social["follower"].isin(top_users) & 
     social["followee"].isin(top_users)
-].copy()
+]
+
+# Keep only edges where follower and followee share the same topic
+def same_topic(row):
+    follower = row["follower"]
+    followee = row["followee"]
+    # Both users must be in the full mapping (they should be)
+    if follower not in user_to_topic_full or followee not in user_to_topic_full:
+        return False
+    return user_to_topic_full[follower] == user_to_topic_full[followee]
+
+#social_sub = social_sub[social_sub.apply(same_topic, axis=1)].copy()
+#print(f"Filtered social edges: kept {len(social_sub)} edges")
 
 # ----------------------------
-# 4. Build node mappings
+# 6. Build node mappings
 # ----------------------------
 users = sorted(
     set(activity_sub["engager"]) | 
@@ -129,20 +156,23 @@ user_to_idx = {u: i for i, u in enumerate(users)}
 post_to_idx = {local_id: U + local_id for local_id in range(P)}
 
 # ----------------------------
-# 5. Build edge indices (unchanged)
+# 7. Build edge indices
 # ----------------------------
+# Social edges
 social_mapped = social_sub.copy()
 social_mapped["follower"] = social_mapped["follower"].map(user_to_idx)
 social_mapped["followee"] = social_mapped["followee"].map(user_to_idx)
 social_mapped = social_mapped.dropna().astype(int)
 edge_index_social = torch.tensor(social_mapped[["follower", "followee"]].values.T, dtype=torch.long)
 
+# Engagement edges (user → post)
 engagement = activity_sub[["engager", "post_id"]].copy()
 engagement["engager"] = engagement["engager"].map(user_to_idx)
 engagement["post_id"] = engagement["post_id"].map(post_to_idx)
 engagement = engagement.dropna().astype(int)
 edge_index_engage = torch.tensor(engagement[["engager", "post_id"]].values.T, dtype=torch.long)
 
+# Authorship edges (post → user)
 authorship = activity_sub[["post_id", "target_user"]].copy()
 authorship["post_id"] = authorship["post_id"].map(post_to_idx)
 authorship["target_user"] = authorship["target_user"].map(user_to_idx)
@@ -150,9 +180,8 @@ authorship = authorship.dropna().astype(int)
 edge_index_author = torch.tensor(authorship[["post_id", "target_user"]].values.T, dtype=torch.long)
 
 # ----------------------------
-# 6. Build node features
+# 8. Build node features
 # ----------------------------
-# User features (unchanged)
 in_social = np.zeros(U)
 out_social = np.zeros(U)
 engagement_count = np.zeros(U)
@@ -172,41 +201,34 @@ user_features = torch.tensor(np.stack([
     np.log(engagement_count + 1)
 ], axis=1), dtype=torch.float)
 
-# Post features: [interaction_type (3) + tweet_embedding (384)]
+# Post features
 print("Encoding tweet semantics...")
 encoder = SentenceTransformer('all-MiniLM-L6-v2')
 tweets = activity_sub["tweet"].tolist()
-tweet_embeddings = encoder.encode(tweets, show_progress_bar=True)  # Shape: [10000, 384]
+tweet_embeddings = encoder.encode(tweets, show_progress_bar=True)
 tweet_embeddings = torch.tensor(tweet_embeddings, dtype=torch.float)
 
-# One-hot interaction types
 interaction_map = {"RT": 0, "RE": 1, "MT": 2}
 interaction_feats = torch.zeros(P, 3)
 for i, inter in enumerate(activity_sub["interaction"]):
     if inter in interaction_map:
         interaction_feats[i, interaction_map[inter]] = 1.0
-    else:
-        print(f"Warning: Unknown interaction '{inter}' at index {i}")
 
-# Combine: [interaction_type, tweet_embedding]
-post_features = torch.cat([interaction_feats, tweet_embeddings], dim=1)  # [10000, 387]
+post_features = torch.cat([interaction_feats, tweet_embeddings], dim=1)
 
-# Full feature matrix
-# Pad user features to match post feature dimension
-post_feat_dim = post_features.size(1)  # 387
-user_feat_dim = user_features.size(1)  # 3
-
+# Pad user features
+post_feat_dim = post_features.size(1)
+user_feat_dim = user_features.size(1)
 if user_feat_dim < post_feat_dim:
     padding = torch.zeros(U, post_feat_dim - user_feat_dim)
     user_features_padded = torch.cat([user_features, padding], dim=1)
 else:
     user_features_padded = user_features
 
-# Now concatenate
 x = torch.cat([user_features_padded, post_features], dim=0)
 
 # ----------------------------
-# 7. Save processed graph
+# 9. Save processed graph
 # ----------------------------
 torch.save({
     'user_to_idx': user_to_idx,
@@ -221,5 +243,6 @@ torch.save({
 print(f"✅ Processed synthetic data with semantics:")
 print(f"   Users: {U}")
 print(f"   Posts: {P}")
+print(f"   Social edges: {edge_index_social.shape[1]}")
 print(f"   Post feature dim: {post_features.shape[1]}")
 print(f"   Saved to: synthetic_processed_with_semantics.pt")
