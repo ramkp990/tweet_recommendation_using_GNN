@@ -81,7 +81,7 @@ torch.save({
 '''
 
 
-
+'''
 import pandas as pd
 import numpy as np
 import torch
@@ -179,6 +179,36 @@ authorship["target_user"] = authorship["target_user"].map(user_to_idx)
 authorship = authorship.dropna().astype(int)
 edge_index_author = torch.tensor(authorship[["post_id", "target_user"]].values.T, dtype=torch.long)
 
+# Build: for each post, who follows its author?
+author_of_post = {}  # post_local_id → author_user_id
+for i in range(graph['post', 'authored_by', 'user'].edge_index.shape[1]):
+    post_local = graph['post', 'authored_by', 'user'].edge_index[0, i].item()
+    author = graph['post', 'authored_by', 'user'].edge_index[1, i].item()
+    author_of_post[post_local] = author
+
+# Build reverse social: user → set of users they follow
+follows = {}
+for i in range(graph['user', 'social', 'user'].edge_index.shape[1]):
+    follower = graph['user', 'social', 'user'].edge_index[0, i].item()
+    followee = graph['user', 'social', 'user'].edge_index[1, i].item()
+    if follower not in follows:
+        follows[follower] = set()
+    follows[follower].add(followee)
+
+# Build followed_by edges: (post, user) if user follows author of post
+src_posts, dst_users = [], []
+for post_local, author in author_of_post.items():
+    for user in range(num_users):
+        if user in follows and author in follows[user]:
+            src_posts.append(post_local)
+            dst_users.append(user)
+
+if src_posts:
+    graph['post', 'followed_by', 'user'].edge_index = torch.tensor([src_posts, dst_users], dtype=torch.long)
+else:
+    # Fallback: empty edge
+    graph['post', 'followed_by', 'user'].edge_index = torch.empty((2, 0), dtype=torch.long)
+
 # ----------------------------
 # 8. Build node features
 # ----------------------------
@@ -245,4 +275,188 @@ print(f"   Users: {U}")
 print(f"   Posts: {P}")
 print(f"   Social edges: {edge_index_social.shape[1]}")
 print(f"   Post feature dim: {post_features.shape[1]}")
+print(f"   Saved to: synthetic_processed_with_semantics.pt")
+'''
+
+import pandas as pd
+import numpy as np
+import torch
+from sentence_transformers import SentenceTransformer
+import json
+
+# ----------------------------
+# 1. Load synthetic activity data
+# ----------------------------
+activity = pd.read_csv("synthetic_higgs_full_all_users.csv")
+required_cols = ["engager", "target_user", "timestamp", "interaction", "tweet"]
+activity = activity[required_cols].copy()
+
+# ----------------------------
+# 2. Load real social network
+# ----------------------------
+social = pd.read_csv("higgs_social_network.edgelist", sep=" ", header=None, names=["follower", "followee"])
+
+# ----------------------------
+# 3. Subset to top 5K users
+# ----------------------------
+user_counts = pd.concat([activity["engager"], activity["target_user"]]).value_counts()
+top_users = user_counts.head(5000).index
+
+activity_sub = activity[
+    activity["engager"].isin(top_users) & 
+    activity["target_user"].isin(top_users)
+].copy().head(10000).reset_index(drop=True)
+activity_sub["post_id"] = activity_sub.index
+
+# ----------------------------
+# 4. Build node mappings
+# ----------------------------
+users = sorted(
+    set(activity_sub["engager"]) | 
+    set(activity_sub["target_user"]) | 
+    set(social["follower"]) | 
+    set(social["followee"])
+)
+U = len(users)
+P = len(activity_sub)
+
+user_to_idx = {u: i for i, u in enumerate(users)}
+post_to_idx = {local_id: U + local_id for local_id in range(P)}
+
+# ----------------------------
+# 5. Build base edge indices
+# ----------------------------
+# Social edges (user → user)
+social_sub = social[
+    social["follower"].isin(top_users) & 
+    social["followee"].isin(top_users)
+].copy()
+social_mapped = social_sub.copy()
+social_mapped["follower"] = social_mapped["follower"].map(user_to_idx)
+social_mapped["followee"] = social_mapped["followee"].map(user_to_idx)
+social_mapped = social_mapped.dropna().astype(int)
+edge_index_social = torch.tensor(social_mapped[["follower", "followee"]].values.T, dtype=torch.long)
+
+# Engagement edges (user → post)
+engagement = activity_sub[["engager", "post_id"]].copy()
+engagement["engager"] = engagement["engager"].map(user_to_idx)
+engagement["post_id"] = engagement["post_id"].map(post_to_idx)
+engagement = engagement.dropna().astype(int)
+edge_index_engage = torch.tensor(engagement[["engager", "post_id"]].values.T, dtype=torch.long)
+
+# Authorship edges (post → user)
+authorship = activity_sub[["post_id", "target_user"]].copy()
+authorship["post_id"] = authorship["post_id"].map(post_to_idx)
+authorship["target_user"] = authorship["target_user"].map(user_to_idx)
+authorship = authorship.dropna().astype(int)
+edge_index_author = torch.tensor(authorship[["post_id", "target_user"]].values.T, dtype=torch.long)
+
+# ----------------------------
+# 6. BUILD FOLLOWED_BY EDGE: (post → user) if user follows the author of the post
+# ----------------------------
+print("Building 'followed_by' edge: user follows author of post...")
+
+# Step 1: Map post (global ID) → author (user local ID)
+post_global_to_author = {}
+for _, row in authorship.iterrows():
+    post_global = int(row["post_id"])
+    author_local = int(row["target_user"])
+    post_global_to_author[post_global] = author_local
+
+# Step 2: Build set of who each user follows (local IDs)
+follows_set = {}
+for _, row in social_mapped.iterrows():
+    follower = int(row["follower"])
+    followee = int(row["followee"])
+    if follower not in follows_set:
+        follows_set[follower] = set()
+    follows_set[follower].add(followee)
+
+# Step 3: For each post, find users who follow its author
+src_posts = []  # post global IDs
+dst_users = []  # user local IDs
+
+for post_global, author_local in post_global_to_author.items():
+    for user_local in range(U):  # all users
+        if user_local in follows_set and author_local in follows_set[user_local]:
+            src_posts.append(post_global)
+            dst_users.append(user_local)
+
+# Convert to edge index (post → user)
+if src_posts:
+    edge_index_followed_by = torch.tensor([src_posts, dst_users], dtype=torch.long)
+else:
+    edge_index_followed_by = torch.empty((2, 0), dtype=torch.long)
+
+print(f"Built 'followed_by' edge with {edge_index_followed_by.shape[1]} connections")
+
+# ----------------------------
+# 7. Build node features
+# ----------------------------
+in_social = np.zeros(U)
+out_social = np.zeros(U)
+engagement_count = np.zeros(U)
+
+for _, row in social_mapped.iterrows():
+    f, t = int(row["follower"]), int(row["followee"])
+    out_social[f] += 1
+    in_social[t] += 1
+
+eng_counts = activity_sub["engager"].map(user_to_idx).value_counts()
+for uid, cnt in eng_counts.items():
+    engagement_count[int(uid)] = cnt
+
+user_features = torch.tensor(np.stack([
+    np.log(in_social + 1),
+    np.log(out_social + 1),
+    np.log(engagement_count + 1)
+], axis=1), dtype=torch.float)
+
+# Post features
+print("Encoding tweet semantics...")
+encoder = SentenceTransformer('all-MiniLM-L6-v2')
+tweets = activity_sub["tweet"].tolist()
+tweet_embeddings = encoder.encode(tweets, show_progress_bar=True)
+tweet_embeddings = torch.tensor(tweet_embeddings, dtype=torch.float)
+
+interaction_map = {"RT": 0, "RE": 1, "MT": 2}
+interaction_feats = torch.zeros(P, 3)
+for i, inter in enumerate(activity_sub["interaction"]):
+    if inter in interaction_map:
+        interaction_feats[i, interaction_map[inter]] = 1.0
+
+post_features = torch.cat([interaction_feats, tweet_embeddings], dim=1)
+
+# Pad user features
+post_feat_dim = post_features.size(1)
+user_feat_dim = user_features.size(1)
+if user_feat_dim < post_feat_dim:
+    padding = torch.zeros(U, post_feat_dim - user_feat_dim)
+    user_features_padded = torch.cat([user_features, padding], dim=1)
+else:
+    user_features_padded = user_features
+
+x = torch.cat([user_features_padded, post_features], dim=0)
+
+# ----------------------------
+# 8. Save processed graph
+# ----------------------------
+torch.save({
+    'user_to_idx': user_to_idx,
+    'post_to_idx': post_to_idx,
+    'x': x,
+    'edge_index_social': edge_index_social,
+    'edge_index_engage': edge_index_engage,
+    'edge_index_author': edge_index_author,
+    'edge_index_followed_by': edge_index_followed_by,  # ← NEW!
+    'activity_sub': activity_sub,
+    'num_users': U,
+    'num_posts': P,
+}, "synthetic_processed_with_semantics.pt")
+
+print(f"✅ Processed synthetic data with semantics:")
+print(f"   Users: {U}")
+print(f"   Posts: {P}")
+print(f"   Social edges: {edge_index_social.shape[1]}")
+print(f"   Followed-by edges: {edge_index_followed_by.shape[1]}")
 print(f"   Saved to: synthetic_processed_with_semantics.pt")

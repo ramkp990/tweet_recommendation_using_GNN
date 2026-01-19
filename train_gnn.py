@@ -1,3 +1,4 @@
+'''
 import torch
 import torch.nn.functional as F
 from torch_geometric.data import HeteroData
@@ -54,26 +55,7 @@ val_end = int(0.9 * n)
 train_interactions = activity_sorted.iloc[:train_end]
 val_interactions = activity_sorted.iloc[train_end:val_end]
 test_interactions = activity_sorted.iloc[val_end:]
-'''
-def build_edge_index(df, user_to_idx, post_to_idx):
-    df = df[["engager", "target_user", "post_id"]].copy()
-    df["engager"] = df["engager"].map(user_to_idx)
-    df["target_user"] = df["target_user"].map(user_to_idx)
-    df["post_id"] = df["post_id"].map(post_to_idx)  # local → global (ONLY ONCE!)
-    df = df.dropna().astype(int)
-    engage = torch.tensor(df[["engager", "post_id"]].values.T, dtype=torch.long)
-    author = torch.tensor(df[["post_id", "target_user"]].values.T, dtype=torch.long)
-    return engage, author
 
-
-# Build training edges
-edge_index_engage_train, edge_index_author_train = build_edge_index(
-    train_interactions, user_to_idx, post_to_idx
-)
-
-val_pos_edges, _ = build_edge_index(val_interactions, user_to_idx, post_to_idx)
-test_pos_edges, _ = build_edge_index(test_interactions, user_to_idx, post_to_idx)  # ← NOW DEFINED!
-'''
 
 def build_edge_index_safe(df, user_to_idx, post_to_idx, num_users):
     engager = []
@@ -240,35 +222,53 @@ class WeightedRGCN(torch.nn.Module):
 class WeightedRGCNFixed(torch.nn.Module):
     def __init__(self, hidden_dim=64):
         super().__init__()
-        self.user_from_social = SAGEConv((-1, -1), hidden_dim)
-        self.user_from_posts = SAGEConv((-1, -1), hidden_dim)
-        self.post_from_users = SAGEConv((-1, -1), hidden_dim)
+        # Message functions
+        self.msg_direct = SAGEConv((-1, -1), hidden_dim)      # user ← post (engagement)
+        self.msg_social = SAGEConv((-1, -1), hidden_dim)      # user ← user (follows)
+        self.msg_author = SAGEConv((-1, -1), hidden_dim)      # user ← post (follows author)
         
-        # FIXED weights (not Parameters)
-        self.w_direct = 1.0
-        self.w_social = 0.3
+        # FIXED weights (prioritize signals)
+        self.w_direct = 1.0   # strongest: "I engaged with this"
+        self.w_author = 0.7   # medium: "I follow the author"
+        self.w_social = 0.3   # weakest: "My friend follows someone"
 
     def forward(self, x_dict, edge_index_dict):
         user_x, post_x = x_dict['user'], x_dict['post']
         
-        msg_social = self.user_from_social(
-            (user_x, user_x),
-            edge_index_dict[('user', 'social', 'user')]
-        )
-        msg_direct = self.user_from_posts(
+        # Direct engagement (user ← post via rev_engages)
+        msg1 = self.msg_direct(
             (post_x, user_x),
             edge_index_dict[('post', 'rev_engages', 'user')]
         )
-        user_out = F.relu(self.w_social * msg_social + self.w_direct * msg_direct)
         
-        msg_engage = self.post_from_users(
-            (user_x, post_x),
-            edge_index_dict[('user', 'engages', 'post')]
+        # Follows author (user ← post via new edge)
+        msg2 = self.msg_author(
+            (post_x, user_x),
+            edge_index_dict[('post', 'followed_by', 'user')]  # ← we'll build this
         )
-        post_out = F.relu(msg_engage)
+        
+        # Social influence (user ← user)
+        msg3 = self.msg_social(
+            (user_x, user_x),
+            edge_index_dict[('user', 'social', 'user')]
+        )
+        
+        # Combine with weights
+        user_out = F.relu(
+            self.w_direct * msg1 +
+            self.w_author * msg2 +
+            self.w_social * msg3
+        )
+        
+        # Update posts (optional)
+        post_out = F.relu(
+            self.msg_direct(
+                (user_x, post_x),
+                edge_index_dict[('user', 'engages', 'post')]
+            )
+        )
         
         return {'user': user_out, 'post': post_out}
-
 
 import torch
 import torch.nn.functional as F
@@ -294,6 +294,172 @@ train_edge_index = graph['user', 'engages', 'post'].edge_index  # [2, num_train]
 # Total number of users and posts
 num_users = graph['user'].num_nodes
 num_posts = graph['post'].num_nodes
+'''
+
+import torch
+import torch.nn.functional as F
+from torch_geometric.data import HeteroData
+from torch_geometric.nn import SAGEConv
+import pandas as pd
+import numpy as np
+import random
+
+# ----------------------------
+# Load processed data
+# ----------------------------
+data = torch.load("synthetic_processed_with_semantics.pt", weights_only=False)
+activity_sub = data['activity_sub']
+user_to_idx = data['user_to_idx']
+post_to_idx = data['post_to_idx']
+x = data['x']
+
+num_users = data['num_users']
+num_posts = data['num_posts']
+
+# Boost semantic part (optional)
+semantic_boost = 2.0
+x[num_users:, 3:] *= semantic_boost
+
+# ----------------------------
+# Temporal split
+# ----------------------------
+activity_sorted = activity_sub.sort_values("timestamp").reset_index(drop=True)
+n = len(activity_sorted)
+train_end = int(0.8 * n)
+val_end = int(0.9 * n)
+
+train_interactions = activity_sorted.iloc[:train_end]
+val_interactions = activity_sorted.iloc[train_end:val_end]
+test_interactions = activity_sorted.iloc[val_end:]
+
+# ----------------------------
+# Helper: build edge index safely
+# ----------------------------
+def build_edge_index_safe(df, user_to_idx, post_to_idx):
+    engager, post_global, target_user = [], [], []
+    for _, row in df.iterrows():
+        u_eng = user_to_idx.get(row["engager"])
+        u_tgt = user_to_idx.get(row["target_user"])
+        p_global = post_to_idx.get(row["post_id"])
+        if u_eng is not None and u_tgt is not None and p_global is not None:
+            engager.append(u_eng)
+            post_global.append(p_global)
+            target_user.append(u_tgt)
+    engager = torch.tensor(engager, dtype=torch.long)
+    post_global = torch.tensor(post_global, dtype=torch.long)
+    target_user = torch.tensor(target_user, dtype=torch.long)
+    engage_edge = torch.stack([engager, post_global], dim=0)
+    author_edge = torch.stack([post_global, target_user], dim=0)
+    return engage_edge, author_edge
+
+# Build test edges
+_, _ = build_edge_index_safe(train_interactions, user_to_idx, post_to_idx)
+_, _ = build_edge_index_safe(val_interactions, user_to_idx, post_to_idx)
+test_pos_edges, _ = build_edge_index_safe(test_interactions, user_to_idx, post_to_idx)
+
+# ----------------------------
+# Build HeteroData graph
+# ----------------------------
+graph = HeteroData()
+
+# Node features
+graph['user'].x = x[:num_users]      # [U, 387]
+graph['post'].x = x[num_users:]      # [P, 387]
+
+# Edge 1: social (user → user)
+src, dst = data['edge_index_social']
+graph['user', 'social', 'user'].edge_index = torch.stack([src, dst], dim=0)
+
+# Edge 2: engages (user → post) — for training
+src, dst = data['edge_index_engage']
+# Convert post global ID → local: global_id - num_users
+post_local = dst - num_users
+mask = (src < num_users) & (post_local >= 0) & (post_local < num_posts)
+graph['user', 'engages', 'post'].edge_index = torch.stack([src[mask], post_local[mask]], dim=0)
+
+# Edge 3: authored_by (post → user)
+src, dst = data['edge_index_author']
+post_local = src - num_users
+mask = (post_local >= 0) & (post_local < num_posts) & (dst < num_users)
+graph['post', 'authored_by', 'user'].edge_index = torch.stack([post_local[mask], dst[mask]], dim=0)
+
+# Edge 4: followed_by (post → user) ← NEW!
+src, dst = data['edge_index_followed_by']
+if src.numel() > 0:
+    post_local = src - num_users
+    mask = (post_local >= 0) & (post_local < num_posts) & (dst < num_users)
+    graph['post', 'followed_by', 'user'].edge_index = torch.stack([post_local[mask], dst[mask]], dim=0)
+else:
+    graph['post', 'followed_by', 'user'].edge_index = torch.empty((2, 0), dtype=torch.long)
+
+# Add reverse edges (for message passing)
+graph['post', 'rev_engages', 'user'].edge_index = graph['user', 'engages', 'post'].edge_index.flip(0)
+
+# ----------------------------
+# Updated WeightedRGCN Model
+# ----------------------------
+class WeightedRGCN(torch.nn.Module):
+    def __init__(self, hidden_dim=64):
+        super().__init__()
+        self.msg_direct = SAGEConv((-1, -1), hidden_dim)   # user ← post (engagement)
+        self.msg_author = SAGEConv((-1, -1), hidden_dim)   # user ← post (follows author)
+        self.msg_social = SAGEConv((-1, -1), hidden_dim)   # user ← user (social)
+        self.post_update = SAGEConv((-1, -1), hidden_dim)  # post ← user (engagement)
+        
+        # FIXED weights
+        self.w_direct = 1.0   # strongest
+        self.w_author = 0.7   # medium
+        self.w_social = 0.3   # weakest
+
+    def forward(self, x_dict, edge_index_dict):
+        user_x, post_x = x_dict['user'], x_dict['post']
+        
+        # User update: combine three signals
+        msg_direct = self.msg_direct(
+            (post_x, user_x),
+            edge_index_dict[('post', 'rev_engages', 'user')]
+        )
+        msg_author = self.msg_author(
+            (post_x, user_x),
+            edge_index_dict[('post', 'followed_by', 'user')]
+        )
+        msg_social = self.msg_social(
+            (user_x, user_x),
+            edge_index_dict[('user', 'social', 'user')]
+        )
+        
+        user_out = F.relu(
+            self.w_direct * msg_direct +
+            self.w_author * msg_author +
+            self.w_social * msg_social
+        )
+        
+        # Post update (optional but helpful)
+        post_out = F.relu(
+            self.post_update(
+                (user_x, post_x),
+                edge_index_dict[('user', 'engages', 'post')]
+            )
+        )
+        
+        return {'user': user_out, 'post': post_out}
+
+# ----------------------------
+# Rest of training code (same as before)
+# ----------------------------
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = WeightedRGCN(hidden_dim=64).to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+criterion = torch.nn.BCEWithLogitsLoss()
+
+graph = graph.to(device)
+x_dict = {'user': graph['user'].x, 'post': graph['post'].x}
+train_edge_index = graph['user', 'engages', 'post'].edge_index
+
+num_users = graph['user'].num_nodes
+num_posts = graph['post'].num_nodes
+
+# ... [rest of your training/evaluation loop remains unchanged] ...
 
 print(f"Training on {train_edge_index.shape[1]} positive edges")
 print(f"Users: {num_users}, Posts: {num_posts}")
