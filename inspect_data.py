@@ -5,7 +5,9 @@ import pandas as pd
 # ----------------------------
 social = pd.read_csv("higgs_social_network.edgelist", sep=" ", header=None, names=["follower", "followee"])
 activity = pd.read_csv("higgs_activity_time.txt", sep=" ", header=None, names=["engager", "target_user", "timestamp", "interaction"])
-
+retweet = pd.read_csv("higgs_retweet_network.edgelist")
+print(social.head(10000))
+'''
 # Assign a unique post ID to each interaction (each row = one "post")
 activity["post_id"] = activity.index
 
@@ -44,3 +46,5 @@ print(f"Users: {len(users)}")
 print(f"Posts: {len(posts)}")
 print(f"Social edges: {len(social_sub)}")
 print(f"Interactions: {len(activity_sub)}")
+
+'''

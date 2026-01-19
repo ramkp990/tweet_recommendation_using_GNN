@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 from torch_geometric.data import HeteroData
 from torch_geometric.nn import HeteroConv, SAGEConv  # SAGEConv works well for heterogeneous graphs
+import random
 
 # ----------------------------
 # Load and prepare data (your code)
@@ -417,9 +418,15 @@ torch.save({
     'num_users': num_users,
 }, "higgs_embeddings_trained.pt")
 
+
+
 # === MANUAL INSPECTION: Print top recommendations for test users ===
 print("\n🔍 SAMPLE RECOMMENDATIONS (Top 3 per user):")
-test_users_sample = list(set(test_edges_device[0].cpu().numpy()))[:5]  # First 5 test users
+#test_users_sample = list(set(test_edges_device[0].cpu().numpy()))[:5]  # First 5 test users
+test_users = list(set(test_edges_device[0].cpu().numpy()))
+
+# Randomly sample 5 (or fewer if not enough)
+test_users_sample = random.sample(test_users, min(5, len(test_users)))
 
 # Load tweet texts for lookup
 activity_sub = data['activity_sub']  # from your loaded .pt file
@@ -452,9 +459,10 @@ for user_global in test_users_sample:
     print("  ✅ True future engagements:")
     for p in true_posts_global:
         tweet = tweet_lookup.get(p, "[MISSING]")
-        print(f"    - {tweet[:60]}...")
+        print(f"    - {tweet}..."+ tweet)
     
     print("  🎯 Top recommendations:")
     for p in top_posts_global:
         tweet = tweet_lookup.get(p, "[MISSING]")
-        print(f"    - {tweet[:60]}...")
+        print(f"    - {tweet}..."+ tweet)
+
