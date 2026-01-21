@@ -375,7 +375,7 @@ activity = pd.read_csv(
 print(f"Loaded {len(activity)} interactions")
 
 # Load full user_to_topic
-with open("user_to_topic_full.json", "r") as f:
+with open("user_to_topic_unified.json", "r") as f:
     user_to_topic = json.load(f)
 user_to_topic = {int(k): int(v) for k, v in user_to_topic.items()}
 print(f"Loaded topics for {len(user_to_topic)} users")
